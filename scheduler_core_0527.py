@@ -81,6 +81,11 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
           "unavailable_slots": [              # (백엔드 추가) 특정 요일의 특정 교대 근무 불가 (하드 제약)
               {"day": 0, "shift": 2},         # 예: 월요일은 가용 시간이 오전까지라 저녁 교대 불가
           ]
+          "skills": ["일본어", "바리스타"]       # (4차 추가) 보유 역량
+        config에 추가 가능한 선택 필드:
+          "skill_requirements": [             # (4차 추가) 교대별 필요 역량 인원 (소프트 제약·고패널티)
+              {"shift": 0, "skill": "일본어", "count": 1},   # 오전 교대에 일본어 가능자 최소 1명
+          ]
 
     Returns
     -------
@@ -105,6 +110,10 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
           ],
           "off_request_violations": [   # 휴무 요청 위반 항목 (위반 없으면 빈 리스트)
               {"employee_id": "emp_001", "day": 3, "shift": 0, "type": "must"},
+              ...
+          ],
+          "skill_shortage_report": [    # (4차 추가) 필요 역량 인원 미달 항목 (없으면 빈 리스트)
+              {"day": 0, "shift": 0, "skill": "일본어", "required": 1, "actual": 0},
               ...
           ],
           "has_multiple_optimal": False,  # 동일 비용의 최적해가 2개 이상인지 여부
@@ -291,6 +300,24 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
         model.Add(h_range == max_hw - min_hw)
         holiday_range_term = HOLIDAY_W * h_range
 
+    # ── [소프트 9] 교대별 필요 역량 인원 미달 패널티 (4차 추가) ─
+    # 예: 외국인 손님이 많은 오전 교대에 일본어 가능자 최소 1명.
+    # 하드 제약으로 두면 역량 보유자가 없는 날 스케줄 전체가 INFEASIBLE이 되므로
+    # 최소 인원([소프트 0])과 같은 방식으로 고패널티 소프트 제약 + skill_shortage_report로 처리한다.
+    # 필수 휴무보다는 낮게 둬서, 역량 보유자의 필수 휴무를 깨면서까지 채우지는 않는다.
+    SKILL_W = 8_000_000
+    skill_shortage_vars = []
+    skill_reqs = [r for r in config.get("skill_requirements", []) if r["shift"] < S and r.get("count", 1) > 0]
+    for r in skill_reqs:
+        skilled = [e for e, emp in enumerate(employees) if r["skill"] in emp.get("skills", [])]
+        for d in range(D):
+            actual = sum(work[e, d, r["shift"]] for e in skilled)
+            for k in range(1, r.get("count", 1) + 1):
+                v = model.NewBoolVar(f"sk_{d}_{r['shift']}_{r['skill']}_{k}")
+                model.Add(actual <= k - 1).OnlyEnforceIf(v)
+                model.Add(actual >= k).OnlyEnforceIf(v.Not())
+                skill_shortage_vars.append(v)
+
     # ── [소프트 8] 재스케줄 시 기존 근무표 변경 최소화 ─
     CHANGE_W = config.get("change_weight", 300_000)
     change_vars = []
@@ -331,6 +358,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
         + FAIRNESS_W    * fairness_range            # 근무일수 편차 (타이브레이킹)
         + holiday_range_term                        # 공휴일 편차 (타이브레이킹)
         + CHANGE_W * sum(change_vars)
+        + SKILL_W  * sum(skill_shortage_vars)       # 필요 역량 인원 미달 (4차 수정 추가)
     )
 
     # ── 솔버 실행 ────────────────────────────────
@@ -358,6 +386,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
             "solve_ms":               solve_ms,
             "shortage_report":        [],
             "off_request_violations": [],
+            "skill_shortage_report":  [],
             "has_multiple_optimal":   False,
             "alt_schedules":          [],
         }
@@ -396,6 +425,25 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
                         "type":        req.get("type", "prefer"),
                     })
 
+    # ── 필요 역량 인원 부족 현황 (4차 추가) ─────────
+    skill_shortage_report = []
+    for r in skill_reqs:
+        required = r.get("count", 1)
+        for d in range(D):
+            actual_cnt = sum(
+                solver.Value(work[e, d, r["shift"]])
+                for e, emp in enumerate(employees)
+                if r["skill"] in emp.get("skills", [])
+            )
+            if actual_cnt < required:
+                skill_shortage_report.append({
+                    "day":      d,
+                    "shift":    r["shift"],
+                    "skill":    r["skill"],
+                    "required": required,
+                    "actual":   actual_cnt,
+                })
+
     # ── 복수 최적해 탐색 ──────────────────────────
     # OPTIMAL인 경우에만 수행.
     # no-good cut: 현재 해를 제외하고 재풀어 같은 목적함수값이 나오면
@@ -427,6 +475,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
         "solve_ms":               solve_ms,
         "shortage_report":        shortage_report,
         "off_request_violations": off_request_violations,
+        "skill_shortage_report":  skill_shortage_report,
         "has_multiple_optimal":   has_multiple_optimal,
         "alt_schedules":          alt_schedules,
     }
