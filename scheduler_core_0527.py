@@ -78,6 +78,9 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
               {"day": 3,  "type": "must"},    # 필수 휴무 (위반 시 고패널티)
               {"day": 10, "type": "prefer"},  # 희망 휴무 (위반 시 중간 패널티)
           ]
+          "unavailable_slots": [              # (백엔드 추가) 특정 요일의 특정 교대 근무 불가 (하드 제약)
+              {"day": 0, "shift": 2},         # 예: 월요일은 가용 시간이 오전까지라 저녁 교대 불가
+          ]
 
     Returns
     -------
@@ -141,6 +144,14 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
             if d not in avail:
                 for s in range(S):
                     model.Add(work[e, d, s] == 0)
+
+    # ── [하드 1-1] 요일별 가용 시간 외 교대 근무 불가 (백엔드 추가) ─
+    # available_days는 요일 단위라, 가용 시간이 09~13시인 직원도 그날 저녁 교대에 배정될 수 있었다.
+    # 백엔드가 직원의 요일별 가용 시간과 교대 시간을 비교해 불가능한 (요일, 교대)를 넘겨준다.
+    for e, emp in enumerate(employees):
+        for slot in emp.get("unavailable_slots", []):
+            if slot["day"] < D and slot["shift"] < S:
+                model.Add(work[e, slot["day"], slot["shift"]] == 0)
 
     # ── [하드 2] 하루 최대 1교대 (이중 근무 금지) ─
     for e in range(E):
@@ -280,6 +291,20 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
         model.Add(h_range == max_hw - min_hw)
         holiday_range_term = HOLIDAY_W * h_range
 
+    # ── [소프트 8] 재스케줄 시 기존 근무표 변경 최소화 ─
+    CHANGE_W = config.get("change_weight", 300_000)
+    change_vars = []
+    prev = config.get("prev_assignments")  # {(emp_id, day): shift}
+    if prev:
+        ids = [emp["id"] for emp in employees]
+        for e in range(E):
+            for d in range(D):
+                ps = prev.get((ids[e], d))
+                for s in range(S):
+                    if ps == s:
+                        change_vars.append(work[e, d, s].Not())
+                    else:
+                        change_vars.append(work[e, d, s]) if ps is not None else None
     # ── 목적함수: 인건비 + 야간수당 + 패널티 최소화 ─
     labor = sum(
         work[e, d, s] * shifts[s]["hours"] * base_hw
@@ -305,6 +330,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
         + PREF_W        * sum(pref_vars)
         + FAIRNESS_W    * fairness_range            # 근무일수 편차 (타이브레이킹)
         + holiday_range_term                        # 공휴일 편차 (타이브레이킹)
+        + CHANGE_W * sum(change_vars)
     )
 
     # ── 솔버 실행 ────────────────────────────────
