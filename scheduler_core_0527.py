@@ -88,6 +88,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
           "skill_requirements": [             # (4차 추가) 교대별 필요 역량 인원 (소프트 제약·고패널티)
               {"shift": 0, "skill": "일본어", "count": 1},   # 오전 교대에 일본어 가능자 최소 1명
           ]
+          "max_staff": [2, 3, 2],             # (5차 추가) 교대별 최대 인원 (하드 제약). 없으면 상한 없음
           "weight_overrides": {               # (5차 추가) 소프트 제약 가중치 덮어쓰기. 없는 키는 기본값
               "FAIRNESS_W": 1_000_000,        # 예: 공평성 우선안
           }
@@ -193,6 +194,14 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
                     for k in range(5)
                     for s in range(S)) <= 4
             )
+
+    # ── [하드 5] 교대별 최대 인원 (5차 추가, 선택) ──
+    # 없으면 상한 없음. 공평성 가중치를 키웠을 때 근무일을 맞추려고 필요 이상 배정하는 것을 막는다.
+    max_s = config.get("max_staff")
+    if max_s is not None:
+        for d in range(D):
+            for s in range(S):
+                model.Add(sum(work[e, d, s] for e in range(E)) <= max_s[s])
 
     # ── [소프트 0] 최소 인원 미달 패널티 ─────────
     # 구 [하드 5]를 소프트 제약으로 완화.
