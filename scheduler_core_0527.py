@@ -14,7 +14,7 @@ import time
 
 
 def _extract_schedule_result(solver, work, employees, shifts, E, D, S, base_hw, night_rate):
-    """현재 solver 해에서 schedule 배열과 총 인건비를 추출한다."""
+    """현재 solver 해에서 schedule 배열과 총 인건비를 추출한다. 직원별 hourly가 있으면 그 시급을 쓴다."""
     schedule = []
     total_cost = 0
     for e, emp in enumerate(employees):
@@ -24,9 +24,10 @@ def _extract_schedule_result(solver, work, employees, shifts, E, D, S, base_hw, 
                 if solver.Value(work[e, d, s]):
                     assignments.append({"day": d, "shift": s})
                     h = shifts[s]["hours"]
-                    total_cost += h * base_hw
+                    hw = emp.get("hourly", base_hw)
+                    total_cost += h * hw
                     if shifts[s]["is_night"]:
-                        total_cost += int(h * base_hw * night_rate)
+                        total_cost += int(h * hw * night_rate)
         schedule.append({"employee_id": emp["id"], "assignments": assignments})
     return schedule, total_cost
 
@@ -82,10 +83,14 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
               {"day": 0, "shift": 2},         # 예: 월요일은 가용 시간이 오전까지라 저녁 교대 불가
           ]
           "skills": ["일본어", "바리스타"]       # (4차 추가) 보유 역량
+          "hourly": 10030                     # (5차 추가) 직원별 시급. 없으면 base_hourly
         config에 추가 가능한 선택 필드:
           "skill_requirements": [             # (4차 추가) 교대별 필요 역량 인원 (소프트 제약·고패널티)
               {"shift": 0, "skill": "일본어", "count": 1},   # 오전 교대에 일본어 가능자 최소 1명
           ]
+          "weight_overrides": {               # (5차 추가) 소프트 제약 가중치 덮어쓰기. 없는 키는 기본값
+              "FAIRNESS_W": 1_000_000,        # 예: 공평성 우선안
+          }
 
     Returns
     -------
@@ -129,6 +134,10 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     base_hw    = config["base_hourly"]
     night_rate = config["night_bonus"]
     time_limit = config.get("time_limit", 10)
+    weight_overrides = config.get("weight_overrides", {})
+
+    def _w(name, default):
+        return weight_overrides.get(name, default)
 
     E = len(employees)
     D = config.get("num_days", 7)   # 7=주간, 30/31=월간
@@ -189,7 +198,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     # 구 [하드 5]를 소프트 제약으로 완화.
     # 패널티가 충분히 크므로 가용 인원이 있으면 반드시 채우고,
     # 가용 인원 자체가 부족할 때는 스케줄을 생성한 뒤 shortage_report로 알린다.
-    MIN_STAFF_W = 50_000_000   # 최소 인원 1명 부족 → 5천만 패널티
+    MIN_STAFF_W = _w("MIN_STAFF_W", 50_000_000)   # 최소 인원 1명 부족 → 5천만 패널티
     min_shortage_vars = []
 
     for d in range(D):
@@ -204,7 +213,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
 
     # ── [소프트 1] 목표 인원 미달 패널티 ─────────
     # 인원 부족 1명당 5,000,000 패널티 (운영 차질 방지)
-    UNDERSTAFF_W = 5_000_000
+    UNDERSTAFF_W = _w("UNDERSTAFF_W", 5_000_000)
     understaff_vars = []
 
     for d in range(D):
@@ -219,7 +228,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
 
     # ── [소프트 2] 주 15시간 미만 패널티 (주휴수당) ─
     # 주 15시간 이상 근무 시 주휴수당 발생 → 15시간 미달 패널티
-    LOW_HOURS_W = 2_000_000
+    LOW_HOURS_W = _w("LOW_HOURS_W", 2_000_000)
     low_hours_vars = []
 
     for e in range(E):
@@ -234,7 +243,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
         low_hours_vars.append(v)
 
     # ── [소프트 3] 선호 교대 외 배정 패널티 ──────
-    PREF_W = 100_000
+    PREF_W = _w("PREF_W", 100_000)
     pref_vars = []
 
     for e, emp in enumerate(employees):
@@ -250,8 +259,8 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     # type="must": 사실상 하드 제약. 인원부족 다음으로 최우선.
     # ── [소프트 5] 희망 휴무 위반 패널티 ──────────
     # type="prefer": 가능하면 배정 안 함. 선호 교대 위반보다 중요.
-    MUST_OFF_W   = 10_000_000
-    PREFER_OFF_W =    200_000
+    MUST_OFF_W   = _w("MUST_OFF_W", 10_000_000)
+    PREFER_OFF_W = _w("PREFER_OFF_W", 200_000)
     must_off_vars   = []
     prefer_off_vars = []
 
@@ -268,7 +277,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
 
     # ── [소프트 6] 근무일수 편차 최소화 (타이브레이킹) ─
     # 직원 간 근무일수 max-min 차를 최소화 → 균등 배분 유도.
-    FAIRNESS_W = 10
+    FAIRNESS_W = _w("FAIRNESS_W", 10)
     work_days_vars = []
     for e in range(E):
         wd = model.NewIntVar(0, D, f"wd_{e}")
@@ -283,7 +292,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
 
     # ── [소프트 7] 공휴일 근무 편차 최소화 (타이브레이킹) ─
     # holiday_indices에 지정된 공휴일의 근무 횟수 편차를 최소화.
-    HOLIDAY_W = 5
+    HOLIDAY_W = _w("HOLIDAY_W", 5)
     holiday_indices = [d for d in config.get("holiday_indices", []) if d < D]
     holiday_range_term = 0
     if holiday_indices and E > 1:
@@ -305,7 +314,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     # 하드 제약으로 두면 역량 보유자가 없는 날 스케줄 전체가 INFEASIBLE이 되므로
     # 최소 인원([소프트 0])과 같은 방식으로 고패널티 소프트 제약 + skill_shortage_report로 처리한다.
     # 필수 휴무보다는 낮게 둬서, 역량 보유자의 필수 휴무를 깨면서까지 채우지는 않는다.
-    SKILL_W = 8_000_000
+    SKILL_W = _w("SKILL_W", 8_000_000)
     skill_shortage_vars = []
     skill_reqs = [r for r in config.get("skill_requirements", []) if r["shift"] < S and r.get("count", 1) > 0]
     for r in skill_reqs:
@@ -319,7 +328,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
                 skill_shortage_vars.append(v)
 
     # ── [소프트 8] 재스케줄 시 기존 근무표 변경 최소화 ─
-    CHANGE_W = config.get("change_weight", 300_000)
+    CHANGE_W = _w("CHANGE_W", config.get("change_weight", 300_000))
     change_vars = []
     prev = config.get("prev_assignments")  # {(emp_id, day): shift}
     if prev:
@@ -334,13 +343,13 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
                         change_vars.append(work[e, d, s]) if ps is not None else None
     # ── 목적함수: 인건비 + 야간수당 + 패널티 최소화 ─
     labor = sum(
-        work[e, d, s] * shifts[s]["hours"] * base_hw
+        work[e, d, s] * shifts[s]["hours"] * employees[e].get("hourly", base_hw)
         for e in range(E)
         for d in range(D)
         for s in range(S)
     )
     night = sum(
-        work[e, d, s] * shifts[s]["hours"] * int(base_hw * night_rate)
+        work[e, d, s] * shifts[s]["hours"] * int(employees[e].get("hourly", base_hw) * night_rate)
         for e in range(E)
         for d in range(D)
         for s in range(S)
