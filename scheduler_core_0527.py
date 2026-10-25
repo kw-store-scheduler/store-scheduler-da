@@ -101,6 +101,11 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
           "open_shifts": [0], "close_shifts": [2],  # (6차 추가) no_open_after_close 판단용 교대 인덱스
           "max_shifts_per_day": 1,            # (6차 추가) 하루 최대 교대 수 (쪼개기 근무면 2)
           "conflicting_shifts": [[0, 1]],     # (6차 추가) 시간이 겹쳐 같은 날 함께 할 수 없는 교대 쌍
+          "consecutive_days_limit": 5,        # (7차 추가, 하드) 매장 연속 근무 한도. 없으면 4 (연속 5일 이상 금지)
+          skill_requirements 항목에 추가 가능 (7차 추가):
+            {"shifts": [0, 1], "skill": "응대@HIGH", "count": 1,   # 여러 교대 중 어디에든 있으면 충족 (예: 피크 12-14시를 덮는 오픈·미들)
+             "days": [1, 4],                                       # 이 날짜에만 적용
+             "weight": 300_000}                                    # 요청별 패널티 (우선 역량은 낮게)
         employees 항목에 추가 가능한 선택 필드 (6차 추가, 모두 소프트 제약):
           "preferred_slots": [{"day": 3, "shift": 0}],  # 날짜×교대 선호. 있으면 preferred_shifts 대신 사용
           "max_weekend_shifts": 2,            # 기간 내 주말 근무 최대 횟수
@@ -109,6 +114,10 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
           "min_total_hours": 64, "max_total_hours": 86,  # 기간 내 근무 시간 범위
           "weight_scale": {"PREF_W": 2.0},    # 이 직원의 개인 선호 패널티 배율 (우선순위 반영)
           off_requests 항목에 "shifts": [1, 2] # 일부 교대만 쉬기 (예: 오후만 쉬기)
+          "mentor_required_days": [0, 1, 2],  # (7차 추가, 하드) 수습 기간. 이 날 근무하면 같은 교대에 수습이 아닌 직원이 1명 이상
+          "max_weekly_hours": 48,             # (7차 추가, 하드) 직원별 주 최대 시간. 다른 직장 시간을 뺀 값 (없으면 max_hours)
+          "avoid_shifts": [2],                # (7차 추가) 피하고 싶은 교대
+          "rest_days_together": True,         # (7차 추가) 주마다 쉬는 날을 이틀 붙여서
 
     Returns
     -------
@@ -220,22 +229,25 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
 
     # ── [하드 3] 주 52시간 초과 금지 (근로기준법) ─
     # (6차 수정) weeks가 있으면 주마다 적용. 없으면 기존처럼 전체 기간에 적용
-    for e in range(E):
+    for e, emp in enumerate(employees):
+        weekly_cap = min(config.get("max_hours", 52), emp.get("max_weekly_hours", config.get("max_hours", 52)))
         for wk in week_groups:
             weekly_hours = sum(
                 work[e, d, s] * shifts[s]["hours"]
                 for d in wk
                 for s in range(S)
             )
-            model.Add(weekly_hours <= config.get("max_hours", 52))
+            model.Add(weekly_hours <= weekly_cap)
 
     # ── [하드 4] 연속 5일 이상 근무 금지 ─────────
+    # (7차 수정) 매장이 consecutive_days_limit을 정하면 그 일수까지 연속 근무 허용. 없으면 기존처럼 4일
+    max_run = config.get("consecutive_days_limit", 4)
     for e in range(E):
-        for d in range(D - 4):
+        for d in range(D - max_run):
             model.Add(
                 sum(work[e, d + k, s]
-                    for k in range(5)
-                    for s in range(S)) <= 4
+                    for k in range(max_run + 1)
+                    for s in range(S)) <= max_run
             )
 
     # ── [하드 5] 교대별 최대 인원 (5차 추가, 선택) ──
@@ -387,17 +399,35 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     # 최소 인원([소프트 0])과 같은 방식으로 고패널티 소프트 제약 + skill_shortage_report로 처리한다.
     # 필수 휴무보다는 낮게 둬서, 역량 보유자의 필수 휴무를 깨면서까지 채우지는 않는다.
     SKILL_W = _w("SKILL_W", 8_000_000)
-    skill_shortage_vars = []
-    skill_reqs = [r for r in config.get("skill_requirements", []) if r["shift"] < S and r.get("count", 1) > 0]
-    for r in skill_reqs:
+    skill_shortage_terms = []
+
+    # (7차 추가) "shift" 하나 대신 "shifts" 여러 개, 적용 날짜 "days", 요청별 "weight"를 받는다
+    def _req_shifts(r):
+        return [s for s in (r["shifts"] if "shifts" in r else [r["shift"]]) if s < S]
+
+    def _req_days(r):
+        return [d for d in r["days"] if d < D] if "days" in r else list(range(D))
+
+    skill_reqs = [r for r in config.get("skill_requirements", []) if _req_shifts(r) and r.get("count", 1) > 0]
+    for i, r in enumerate(skill_reqs):
         skilled = [e for e, emp in enumerate(employees) if r["skill"] in emp.get("skills", [])]
-        for d in range(D):
-            actual = sum(work[e, d, r["shift"]] for e in skilled)
+        weight = r.get("weight", SKILL_W)
+        for d in _req_days(r):
+            actual = sum(work[e, d, s] for e in skilled for s in _req_shifts(r))
             for k in range(1, r.get("count", 1) + 1):
-                v = model.NewBoolVar(f"sk_{d}_{r['shift']}_{r['skill']}_{k}")
+                v = model.NewBoolVar(f"sk_{i}_{d}_{k}")
                 model.Add(actual <= k - 1).OnlyEnforceIf(v)
                 model.Add(actual >= k).OnlyEnforceIf(v.Not())
-                skill_shortage_vars.append(v)
+                skill_shortage_terms.append((v, weight))
+
+    # ── [하드 6] 수습 기간 선임 동행 (7차 추가) ──
+    # 수습인 날 근무하면 같은 교대에 그날 수습이 아닌 직원이 최소 1명 있어야 한다
+    mentor_days = [set(d for d in emp.get("mentor_required_days", []) if d < D) for emp in employees]
+    for e in range(E):
+        for d in mentor_days[e]:
+            mentors = [k for k in range(E) if k != e and d not in mentor_days[k]]
+            for s in range(S):
+                model.Add(work[e, d, s] <= sum(work[k, d, s] for k in mentors))
 
     # ── [소프트 10] 개인 근무 규칙 (6차 추가) ─────
     # 직원이 희망 제출 때 정한 주말 횟수·연속 근무·근무 리듬·근무량. 인원 확보보다는 낮고 희망 휴무와 비슷한 수준
@@ -405,6 +435,8 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     CONSEC_W  = _w("CONSEC_W", 300_000)
     RHYTHM_W  = _w("RHYTHM_W", 300_000)
     HOURS_W   = _w("HOURS_W", 20_000)    # 범위를 벗어난 1시간당
+    AVOID_W   = _w("AVOID_W", 300_000)   # (7차) 피하고 싶은 교대 배정 1건
+    REST_PAIR_W = _w("REST_PAIR_W", 200_000)  # (7차) 쉬는 날을 붙이지 못한 주 1개
     personal_terms = []
     weekend_days = [d for d in config.get("weekend_days", []) if d < D]
     open_shifts  = [s for s in config.get("open_shifts", []) if s < S]
@@ -436,6 +468,31 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
                     for o in open_shifts:
                         model.Add(work[e, d, c] + work[e, d + 1, o] <= 1 + v)
                 personal_terms.append((v, _ew(emp, "RHYTHM_W", RHYTHM_W)))
+
+        for s in emp.get("avoid_shifts", []):
+            if s < S:
+                for d in range(D):
+                    personal_terms.append((work[e, d, s], _ew(emp, "AVOID_W", AVOID_W)))
+
+        # 7일이 다 들어 있는 주마다, 이어진 이틀을 모두 쉬는 날이 한 번이라도 있으면 충족
+        if emp.get("rest_days_together"):
+            full_weeks = [wk for wk in week_groups if len(wk) == 7]
+            for w, wk in enumerate(full_weeks):
+                rest = []
+                for d in wk:
+                    r = model.NewBoolVar(f"rest_{e}_{d}")
+                    model.Add(sum(work[e, d, s] for s in range(S)) == 0).OnlyEnforceIf(r)
+                    model.Add(sum(work[e, d, s] for s in range(S)) >= 1).OnlyEnforceIf(r.Not())
+                    rest.append(r)
+                pairs = []
+                for i in range(len(rest) - 1):
+                    p = model.NewBoolVar(f"rp_{e}_{w}_{i}")
+                    model.AddBoolAnd([rest[i], rest[i + 1]]).OnlyEnforceIf(p)
+                    model.AddBoolOr([rest[i].Not(), rest[i + 1].Not()]).OnlyEnforceIf(p.Not())
+                    pairs.append(p)
+                missing = model.NewBoolVar(f"rpm_{e}_{w}")
+                model.AddBoolOr(pairs + [missing])
+                personal_terms.append((missing, _ew(emp, "REST_PAIR_W", REST_PAIR_W)))
 
         min_h, max_h = emp.get("min_total_hours"), emp.get("max_total_hours")
         if min_h is not None or max_h is not None:
@@ -491,7 +548,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
         + FAIRNESS_W    * fairness_range            # 근무일수 편차 (타이브레이킹)
         + holiday_range_term                        # 공휴일 편차 (타이브레이킹)
         + CHANGE_W * sum(change_vars)
-        + SKILL_W  * sum(skill_shortage_vars)       # 필요 역량 인원 미달 (4차 수정 추가)
+        + sum(w * v for v, w in skill_shortage_terms)  # 필요 역량 인원 미달 (4차 추가, 7차 요청별 가중치)
     )
 
     # ── 솔버 실행 ────────────────────────────────
@@ -562,16 +619,18 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     skill_shortage_report = []
     for r in skill_reqs:
         required = r.get("count", 1)
-        for d in range(D):
+        for d in _req_days(r):
             actual_cnt = sum(
-                solver.Value(work[e, d, r["shift"]])
+                solver.Value(work[e, d, s])
                 for e, emp in enumerate(employees)
                 if r["skill"] in emp.get("skills", [])
+                for s in _req_shifts(r)
             )
             if actual_cnt < required:
                 skill_shortage_report.append({
                     "day":      d,
-                    "shift":    r["shift"],
+                    "shift":    _req_shifts(r)[0],
+                    "shifts":   _req_shifts(r),   # (7차 추가)
                     "skill":    r["skill"],
                     "required": required,
                     "actual":   actual_cnt,
