@@ -1,4 +1,4 @@
-# 매장 근무 스케줄러 최적화 엔진 — 개발 보고서 (3차 수정본)
+# 매장 근무 스케줄러 최적화 엔진 — 개발 보고서 (4차 수정본)
 
 > **대상 파일**
 > - `scheduler_core_0527.py` — CP-SAT 기반 최적화 엔진
@@ -13,7 +13,8 @@
 |------|--------------|
 | 1차 | 인원 부족 시 INFEASIBLE → 소프트 제약 전환 / 복수 최적해 감지 / 월간 스케줄 확장 / 주간 목 데이터, 월간  |
 | 2차 | off_requests(필수·희망 휴무) 추가 / 근무일수·공휴일 균등 배분(타이브레이킹) / role_level 설계 확정 / 주간, 월간 추가 |
-| **3차** | **재스케줄 시 기존 근무표 변경 최소화(prev_assignments) / 요일별 교대 근무 불가(unavailable_slots) — 백엔드 연동 과정에서 추가** |
+| 3차 | 재스케줄 시 기존 근무표 변경 최소화(prev_assignments) / 요일별 교대 근무 불가(unavailable_slots) — 백엔드 연동 과정에서 추가 |
+| **4차** | **교대별 필요 역량 인원(skill_requirements, 예: 일본어 가능자 1명) / skill_shortage_report** |
 
 ---
 
@@ -257,6 +258,7 @@ HOLIDAY_W = 5  # FAIRNESS_W보다 낮은 가중치
 목적함수 = 인건비 + 야간수당
          + MIN_STAFF_W   × 최소인원_부족_건수       ← 최우선
          + MUST_OFF_W    × 필수휴무_위반_건수        ← 2차 수정 추가
+         + SKILL_W       × 필요역량_인원_미달_건수   ← 4차 수정 추가
          + UNDERSTAFF_W  × 목표인원_미달_건수
          + LOW_HOURS_W   × 주15h미만_직원수
          + PREFER_OFF_W  × 희망휴무_위반_건수        ← 2차 수정 추가
@@ -270,6 +272,7 @@ HOLIDAY_W = 5  # FAIRNESS_W보다 낮은 가중치
 |------|-----|------|
 | `MIN_STAFF_W` | 50,000,000 | 최소 인원 1명 부족 |
 | `MUST_OFF_W` | 10,000,000 | 필수 휴무 1건 위반 |
+| `SKILL_W` | 8,000,000 | 필요 역량 인원 1명 미달 (4차 추가) |
 | `UNDERSTAFF_W` | 5,000,000 | 목표 인원 1명 미달 |
 | `LOW_HOURS_W` | 2,000,000 | 주 15시간 미만 직원 1명 |
 | `PREFER_OFF_W` | 200,000 | 희망 휴무 1건 위반 |
@@ -325,6 +328,40 @@ model.Add(weekly_hours <= config.get("max_hours", 52))
 ]
 ```
 
+## 6-2. 4차 수정 — 교대별 필요 역량 인원 (`skill_requirements`)
+
+외국인 손님이 많은 시간대에 일본어 가능자, 음료 제조가 몰리는 시간대에 바리스타처럼
+**특정 역량을 가진 직원이 교대마다 일정 인원 이상** 있어야 하는 경우를 처리한다.
+
+```python
+# employee에 추가 (선택)
+"skills": ["일본어"]
+
+# config에 추가 (선택)
+"skill_requirements": [
+    {"shift": 0, "skill": "일본어", "count": 1}   # 오전 교대에 일본어 가능자 최소 1명 (매일)
+]
+```
+
+### 하드가 아닌 고패널티 소프트 제약으로 둔 이유
+
+역량 보유자가 쉬는 날이 하루라도 있으면 하드 제약은 스케줄 전체를 INFEASIBLE로 만든다.
+1차 수정에서 최소 인원을 소프트로 바꾼 것과 같은 이유로, 위반 시 큰 패널티를 주고 불가능한 날만 `skill_shortage_report`로 보고한다.
+
+| 비교 대상 | 우선순위 | 이유 |
+|-----------|----------|------|
+| 최소 인원 (`MIN_STAFF_W` 5천만) | 역량보다 높음 | 사람이 아예 없는 것보다는 역량 없는 사람이라도 있는 게 낫다 |
+| 필수 휴무 (`MUST_OFF_W` 1천만) | 역량보다 높음 | 역량 보유자의 필수 휴무를 깨면서까지 채우지 않는다 |
+| 목표 인원 (`UNDERSTAFF_W` 5백만) | 역량보다 낮음 | 인원 수를 맞추는 것보다 필요한 역량을 갖추는 게 우선 |
+
+```python
+"skill_shortage_report": [
+    {"day": 3, "shift": 0, "skill": "일본어", "required": 1, "actual": 0}
+]
+```
+
+> 4-4절 `role_level`(직급 기반 배치)과는 별개 기능이다. 역할은 숫자 등급 비교, 역량은 보유 여부(태그) 비교라 함께 써도 충돌하지 않는다.
+
 ---
 
 ## 7. 최종 API 명세 (반환 구조)
@@ -342,6 +379,10 @@ model.Add(weekly_hours <= config.get("max_hours", 52))
 
     "off_request_violations": [ # 휴무 요청 위반 (없으면 빈 리스트) ← 2차 추가
         {"employee_id": "emp_001", "day": 3, "shift": 0, "type": "prefer"}
+    ],
+
+    "skill_shortage_report": [  # 필요 역량 인원 미달 (없으면 빈 리스트) ← 4차 추가
+        {"day": 3, "shift": 0, "skill": "일본어", "required": 1, "actual": 0}
     ],
 
     "has_multiple_optimal": False,
@@ -495,4 +536,5 @@ target_staff = [3,3] → 하루 6명 필요 → 매일 2명 쉬는 구조
 *최초 작성: 2025년 5월 (1차)
 *2차 수정: 2026년 6월 8일*
 *3차 수정: 2026년 10월 24일 (백엔드 연동 — prev_assignments, unavailable_slots)*
-*대상 버전: `scheduler_core_0527.py` 3차 수정본*
+*4차 수정: 2026년 10월 24일 (skill_requirements, skill_shortage_report)*
+*대상 버전: `scheduler_core_0527.py` 4차 수정본*
