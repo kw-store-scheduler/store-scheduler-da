@@ -78,6 +78,7 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
           "off_requests": [
               {"day": 3,  "type": "must"},    # 필수 휴무 (위반 시 고패널티)
               {"day": 10, "type": "prefer"},  # 희망 휴무 (위반 시 중간 패널티)
+              {"day": 5, "type": "must", "weight": 9_000_000},  # (5차 추가) 요청별 패널티 지정
           ]
           "unavailable_slots": [              # (백엔드 추가) 특정 요일의 특정 교대 근무 불가 (하드 제약)
               {"day": 0, "shift": 2},         # 예: 월요일은 가용 시간이 오전까지라 저녁 교대 불가
@@ -270,19 +271,19 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     # type="prefer": 가능하면 배정 안 함. 선호 교대 위반보다 중요.
     MUST_OFF_W   = _w("MUST_OFF_W", 10_000_000)
     PREFER_OFF_W = _w("PREFER_OFF_W", 200_000)
-    must_off_vars   = []
-    prefer_off_vars = []
+    # (5차 추가) 요청마다 "weight"를 주면 그 값으로 패널티. 예: 정규직 필수 휴무를 알바보다 먼저 깨도록 낮게
+    must_off_terms   = []
+    prefer_off_terms = []
 
     for e, emp in enumerate(employees):
         for req in emp.get("off_requests", []):
             d = req["day"]
             if d >= D:
                 continue
+            is_must = req.get("type", "prefer") == "must"
+            weight = req.get("weight", MUST_OFF_W if is_must else PREFER_OFF_W)
             for s in range(S):
-                if req.get("type", "prefer") == "must":
-                    must_off_vars.append(work[e, d, s])
-                else:
-                    prefer_off_vars.append(work[e, d, s])
+                (must_off_terms if is_must else prefer_off_terms).append((work[e, d, s], weight))
 
     # ── [소프트 6] 근무일수 편차 최소화 (타이브레이킹) ─
     # 직원 간 근무일수 max-min 차를 최소화 → 균등 배분 유도.
@@ -368,10 +369,10 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     model.Minimize(
         labor + night
         + MIN_STAFF_W   * sum(min_shortage_vars)   # 최소 인원 미달 (최우선)
-        + MUST_OFF_W    * sum(must_off_vars)        # 필수 휴무 위반
+        + sum(w * v for v, w in must_off_terms)     # 필수 휴무 위반
         + UNDERSTAFF_W  * sum(understaff_vars)
         + LOW_HOURS_W   * sum(low_hours_vars)
-        + PREFER_OFF_W  * sum(prefer_off_vars)      # 희망 휴무 위반
+        + sum(w * v for v, w in prefer_off_terms)   # 희망 휴무 위반
         + PREF_W        * sum(pref_vars)
         + FAIRNESS_W    * fairness_range            # 근무일수 편차 (타이브레이킹)
         + holiday_range_term                        # 공휴일 편차 (타이브레이킹)
