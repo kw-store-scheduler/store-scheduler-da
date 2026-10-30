@@ -116,6 +116,9 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
           off_requests 항목에 "shifts": [1, 2] # 일부 교대만 쉬기 (예: 오후만 쉬기)
           "mentor_required_days": [0, 1, 2],  # (7차 추가, 하드) 수습 기간. 이 날 근무하면 같은 교대에 수습이 아닌 직원이 1명 이상
           "max_weekly_hours": 48,             # (7차 추가, 하드) 직원별 주 최대 시간. 다른 직장 시간을 뺀 값 (없으면 max_hours)
+          "prior_run_days": 3,                # (8차 추가, 하드) 기간 직전까지 이어진 연속 근무일
+          "next_run_days": 2,                 # (8차 추가, 하드) 기간 직후부터 이어진 연속 근무일
+          "week_prior_hours": {"0": 16},      # (8차 추가, 하드) 주 인덱스별로 기간 밖에서 이미 잡힌 시간. 월을 걸친 주의 주 최대 시간 계산용
           "avoid_shifts": [2],                # (7차 추가) 피하고 싶은 교대
           "rest_days_together": True,         # (7차 추가) 주마다 쉬는 날을 이틀 붙여서
 
@@ -231,13 +234,15 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
     # (6차 수정) weeks가 있으면 주마다 적용. 없으면 기존처럼 전체 기간에 적용
     for e, emp in enumerate(employees):
         weekly_cap = min(config.get("max_hours", 52), emp.get("max_weekly_hours", config.get("max_hours", 52)))
-        for wk in week_groups:
+        week_prior = emp.get("week_prior_hours", {})
+        for w, wk in enumerate(week_groups):
             weekly_hours = sum(
                 work[e, d, s] * shifts[s]["hours"]
                 for d in wk
                 for s in range(S)
             )
-            model.Add(weekly_hours <= weekly_cap)
+            # (8차 수정) 기간 밖 시간이 이미 한도를 넘었어도 해가 없어지지 않도록 0 아래로 내리지 않는다
+            model.Add(weekly_hours <= max(0, weekly_cap - week_prior.get(str(w), 0)))
 
     # ── [하드 4] 연속 5일 이상 근무 금지 ─────────
     # (7차 수정) 매장이 consecutive_days_limit을 정하면 그 일수까지 연속 근무 허용. 없으면 기존처럼 4일
@@ -249,6 +254,16 @@ def solve_schedule(config: dict, max_alt_solutions: int = 3) -> dict:
                     for k in range(max_run + 1)
                     for s in range(S)) <= max_run
             )
+    # (8차 추가) 앞뒤 기간과 이어지는 연속 근무도 한도 안에서
+    for e, emp in enumerate(employees):
+        for p in range(1, min(emp.get("prior_run_days", 0), max_run) + 1):
+            q = max_run + 1 - p
+            if q <= D:
+                model.Add(sum(work[e, d, s] for d in range(q) for s in range(S)) <= q - 1)
+        for p in range(1, min(emp.get("next_run_days", 0), max_run) + 1):
+            q = max_run + 1 - p
+            if q <= D:
+                model.Add(sum(work[e, d, s] for d in range(D - q, D) for s in range(S)) <= q - 1)
 
     # ── [하드 5] 교대별 최대 인원 (5차 추가, 선택) ──
     # 없으면 상한 없음. 공평성 가중치를 키웠을 때 근무일을 맞추려고 필요 이상 배정하는 것을 막는다.
